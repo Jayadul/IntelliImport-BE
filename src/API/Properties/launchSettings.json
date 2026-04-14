@@ -1,0 +1,13 @@
+{
+  "profiles": {
+    "IntelliImport.API": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "launchUrl": "swagger",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:6203;http://localhost:6204"
+    }
+  }
+}
