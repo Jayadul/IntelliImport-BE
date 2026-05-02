@@ -1,6 +1,4 @@
 using IntelliImport.Application.Models;
-using IntelliImport.Domain.Interfaces;
-using IntelliImport.Domain.ValueObjects;
 using MediatR;
 
 namespace IntelliImport.Application.Features.Extractions.Queries;

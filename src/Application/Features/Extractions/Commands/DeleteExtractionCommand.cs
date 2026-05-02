@@ -1,10 +1,8 @@
-using IntelliImport.Domain.Interfaces;
-using IntelliImport.Domain.ValueObjects;
 using MediatR;
 
 namespace IntelliImport.Application.Features.Extractions.Commands;
 
-using CommandResult = IntelliImport.Domain.ValueObjects.Result;
+using CommandResult = IntelliImport.Domain.Results.Result;
 
 public sealed record DeleteExtractionCommand(Guid Id) : IRequest<CommandResult>;
 
@@ -15,7 +13,7 @@ public sealed class DeleteExtractionCommandHandler(IExtractionRepository reposit
     {
         var deleted = await repository.DeleteAsync(request.Id, ct);
         return deleted
-            ? CommandResult.Ok
+            ? CommandResult.Success()
             : CommandResult.Failure($"Extraction {request.Id} not found.", "NOT_FOUND");
     }
 }

@@ -7,58 +7,42 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ── Services ──────────────────────────────────────────────────────────────
+// Services
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(c =>
-{
-    c.SwaggerDoc("v1", new() { Title = "IntelliImport API", Version = "v1" });
-});
+builder.Services.AddSwaggerGen();
 
-// Kestrel timeouts for long-running AI operations
-// These must be >= HttpClient timeout >= Polly TotalRequestTimeout
+// Kestrel timeouts (fire-and-forget pattern means quick response)
 builder.Services.Configure<KestrelServerOptions>(options =>
 {
-    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(200);
-    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(200);
+    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(75);
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(75);
 });
 
-// Infrastructure (EF, Ollama, PdfPig, Polly)
+// Infrastructure
 builder.Services.AddInfrastructure(builder.Configuration);
 
-// MediatR — scan Application assembly for handlers
+// MediatR
 builder.Services.AddMediatR(cfg =>
     cfg.RegisterServicesFromAssemblyContaining<ProcessPdfCommand>());
 
-// CORS — allow Angular dev server
+// CORS
 builder.Services.AddCors(opts => opts.AddPolicy("Angular", p =>
     p.WithOrigins("http://localhost:4200", "http://localhost:4201")
      .AllowAnyMethod()
      .AllowAnyHeader()
      .AllowCredentials()));
 
-// After services are configured, before app.Build()
-var ollama = builder.Configuration.GetSection("Ollama");
-builder.Logging.AddConsole();
-
 var app = builder.Build();
 
-// Log configuration info
-var logger = app.Services.GetRequiredService<ILogger<Program>>();
-logger.LogInformation(
-    "Ollama configured: BaseUrl={Url}, Model={Model}, Timeout={Timeout}s",
-    ollama["BaseUrl"],
-    ollama["Model"],
-    ollama["TimeoutSecs"]);
-
-// ── Auto-migrate on startup ────────────────────────────────────────────────
+// Auto-migrate
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     await db.Database.MigrateAsync();
 }
 
-// ── Pipeline ───────────────────────────────────────────────────────────────
+// Pipeline
 app.UseMiddleware<GlobalExceptionMiddleware>();
 
 if (app.Environment.IsDevelopment())

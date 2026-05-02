@@ -17,34 +17,41 @@ public static class DependencyInjection
         this IServiceCollection services,
         IConfiguration config)
     {
-        // EF Core with extended command timeout
+        // Database
         services.AddDbContext<AppDbContext>(opts =>
             opts.UseSqlServer(
                 config.GetConnectionString("DefaultConnection"),
                 sql => sql.EnableRetryOnFailure(3).CommandTimeout(180)
             ));
 
+        // Repositories
         services.AddScoped<IExtractionRepository, ExtractionRepository>();
+
+        // PDF Processing - explicitly using Domain.Interfaces
         services.AddScoped<IPdfProcessor, PdfPigProcessor>();
 
-        // Ollama options from configuration
-        services.Configure<OllamaOptions>(config.GetSection("Ollama"));
+        // Text Processing
+        services.AddScoped<PdfTextProcessor>();
 
-        // HttpClient with resilience policies
-        // CRITICAL: HttpClient timeout MUST be >= Polly TotalRequestTimeout
-        services.AddHttpClient<IExtractionProvider, OllamaExtractionProvider>(client =>
+        // Llama Configuration
+        services.Configure<LlamaOptions>(config.GetSection("Llama"));
+
+        // Llama HttpClient with Polly
+        services.AddHttpClient<IExtractionProvider, LlamaExtractionProvider>(client =>
         {
-            var baseUrl = config["Ollama:BaseUrl"] ?? "http://localhost:11434";
-            var timeoutSecs = config.GetValue<int>("Ollama:TimeoutSecs", 180);
-            
+            var baseUrl = config["Llama:BaseUrl"] ?? "http://localhost:11434";
+            var timeoutSecs = config.GetValue<int>("Llama:TimeoutSecs", 120);
+
             client.BaseAddress = new Uri(baseUrl);
-            // Set HttpClient timeout to be larger than Polly's TotalRequestTimeout
             client.Timeout = TimeSpan.FromSeconds(timeoutSecs);
         })
-        .AddStandardResilienceHandler(config.GetSection("OllamaResilience"));
+        .AddStandardResilienceHandler(config.GetSection("LlamaResilience"));
 
+        // Application Services
         services.AddScoped<ExtractionJobProcessor>();
-        services.AddHostedService<ExtractionBackgroundService>();
+
+        // Queued Background Service
+        services.AddQueuedExtraction();
 
         return services;
     }

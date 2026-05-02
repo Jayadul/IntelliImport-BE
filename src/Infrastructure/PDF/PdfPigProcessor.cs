@@ -1,51 +1,45 @@
-using System.Text;
-using IntelliImport.Application.Abstractions;
-using IntelliImport.Domain.ValueObjects;
-using Microsoft.Extensions.Logging;
+using IntelliImport.Domain.Interfaces;
+using IntelliImport.Domain.Results;
 using UglyToad.PdfPig;
-using UglyToad.PdfPig.Content;
+using Microsoft.Extensions.Logging;
 
 namespace IntelliImport.Infrastructure.PDF;
 
-public sealed class PdfPigProcessor(ILogger<PdfPigProcessor> logger) : IPdfProcessor
+public sealed class PdfPigProcessor(
+    ILogger<PdfPigProcessor> logger
+) : IPdfProcessor
 {
-    public Result<string> ExtractText(byte[] pdfBytes)
+    public Result<string> ExtractText(byte[] fileBytes)
     {
-        if (pdfBytes is null || pdfBytes.Length == 0)
-            return Result<string>.Failure("PDF bytes are empty.", "EMPTY_PDF");
-
         try
         {
-            using var document = PdfDocument.Open(pdfBytes);
-            var sb             = new StringBuilder();
-            var pageCount      = 0;
+            using var document = PdfDocument.Open(fileBytes);
 
-            foreach (Page page in document.GetPages())
+            var textBuilder = new System.Text.StringBuilder();
+            var pageCount = document.NumberOfPages;
+
+            for (int i = 1; i <= pageCount; i++)
             {
-                pageCount++;
-                // PdfPig preserves reading order via letter positions
-                var words = page.GetWords();
-                foreach (var word in words)
-                    sb.Append(word.Text).Append(' ');
-
-                sb.AppendLine(); // blank line between pages
+                var page = document.GetPage(i);
+                var text = page.Text;
+                textBuilder.AppendLine($"--- Page {i} ---");
+                textBuilder.AppendLine(text);
+                textBuilder.AppendLine();
             }
 
-            var text = sb.ToString().Trim();
+            var extractedText = textBuilder.ToString();
+            logger.LogInformation(
+                "PdfPig extracted {Chars} chars from {Pages} pages",
+                extractedText.Length, pageCount);
 
-            if (string.IsNullOrWhiteSpace(text))
-                return Result<string>.Failure(
-                    "PDF contained no extractable text (may be image-only).", "NO_TEXT");
-
-            logger.LogInformation("PdfPig extracted {Chars} chars from {Pages} pages",
-                text.Length, pageCount);
-
-            return Result<string>.Success(text);
+            return Result<string>.Success(extractedText);
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "PdfPig failed to parse document");
-            return Result<string>.Failure($"PDF parse error: {ex.Message}", "PDF_PARSE_ERROR");
+            logger.LogError(ex, "PDF text extraction failed");
+            return Result<string>.Failure(
+                $"PDF extraction error: {ex.Message}",
+                "PDF_PARSE_ERROR");
         }
     }
 }

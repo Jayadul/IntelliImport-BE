@@ -1,5 +1,5 @@
 using IntelliImport.Application.Models;
-using IntelliImport.Domain.ValueObjects;
+using IntelliImport.Domain.Results;
 
 namespace IntelliImport.Application.Abstractions;
 
@@ -11,5 +11,8 @@ namespace IntelliImport.Application.Abstractions;
 public interface IExtractionProvider
 {
     string ProviderName { get; }
-    Task<Result<ExtractionResult>> ExtractAsync(string pdfText, CancellationToken ct = default);
+
+    Task<Result<ExtractionResult>> ExtractAsync(
+        string pdfText,
+        CancellationToken ct = default);
 }
