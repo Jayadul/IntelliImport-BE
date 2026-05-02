@@ -27,7 +27,7 @@ public static class DependencyInjection
         // Repositories
         services.AddScoped<IExtractionRepository, ExtractionRepository>();
 
-        // PDF Processing - explicitly using Domain.Interfaces
+        // PDF Processing
         services.AddScoped<IPdfProcessor, PdfPigProcessor>();
 
         // Text Processing
@@ -47,11 +47,14 @@ public static class DependencyInjection
         })
         .AddStandardResilienceHandler(config.GetSection("LlamaResilience"));
 
+        // Job Queue (in-memory channel)
+        services.AddSingleton<IJobQueue, JobQueue>();
+
         // Application Services
         services.AddScoped<ExtractionJobProcessor>();
 
-        // Queued Background Service
-        services.AddQueuedExtraction();
+        // Background Service
+        services.AddHostedService<ExtractionBackgroundService>();
 
         return services;
     }

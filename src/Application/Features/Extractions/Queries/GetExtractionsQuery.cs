@@ -3,34 +3,31 @@ using MediatR;
 
 namespace IntelliImport.Application.Features.Extractions.Queries;
 
-public sealed record GetExtractionsQuery(int Page = 1, int PageSize = 20)
-    : IRequest<Result<PagedResult<ExtractionSummaryDto>>>;
+public sealed record GetExtractionsQuery(int Page, int PageSize) : IRequest<Result<List<ExtractionSummaryDto>>>;
 
-public sealed record PagedResult<T>(
-    IReadOnlyList<T> Items,
-    int              TotalCount,
-    int              Page,
-    int              PageSize,
-    int              TotalPages
-);
-
-public sealed class GetExtractionsQueryHandler(IExtractionRepository repository)
-    : IRequestHandler<GetExtractionsQuery, Result<PagedResult<ExtractionSummaryDto>>>
+public sealed class GetExtractionsQueryHandler(
+    IExtractionRepository repository
+) : IRequestHandler<GetExtractionsQuery, Result<List<ExtractionSummaryDto>>>
 {
-    public async Task<Result<PagedResult<ExtractionSummaryDto>>> Handle(
+    public async Task<Result<List<ExtractionSummaryDto>>> Handle(
         GetExtractionsQuery request, CancellationToken ct)
     {
-        var items  = await repository.GetAllAsync(request.Page, request.PageSize, ct);
-        var total  = await repository.GetTotalCountAsync(ct);
-        var pages  = (int)Math.Ceiling((double)total / request.PageSize);
+        var items = await repository.GetAllAsync(request.Page, request.PageSize, ct);
 
         var dtos = items.Select(r => new ExtractionSummaryDto(
-            r.Id, r.FileName, r.InvoiceNo, r.Vendor, r.InvoiceDate,
-            r.TotalAmount, r.ConfidenceScore, r.IsLineItemSumValid,
-            r.Status.ToString(), r.ProcessingMs, r.CreatedAt
+            r.Id,
+            r.FileName,
+            r.InvoiceNo,
+            r.Vendor,
+            r.InvoiceDate,
+            r.TotalAmount,
+            r.ConfidenceScore,
+            r.IsLineItemSumValid,
+            r.Status.ToString(),
+            r.ProcessingMs,
+            r.CreatedAt
         )).ToList();
 
-        return Result<PagedResult<ExtractionSummaryDto>>.Success(
-            new PagedResult<ExtractionSummaryDto>(dtos, total, request.Page, request.PageSize, pages));
+        return Result<List<ExtractionSummaryDto>>.Success(dtos);
     }
 }

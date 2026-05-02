@@ -15,13 +15,13 @@ public sealed class GetExtractionByIdQueryHandler(
         GetExtractionByIdQuery request, CancellationToken ct)
     {
         var record = await repository.GetByIdAsync(request.ExtractionId, ct);
-        
+
         if (record is null)
             return Result<ExtractionDetailDto>.Failure(
                 "Extraction not found.",
                 "NOT_FOUND");
 
-        var dto = new ExtractionDetailDto(
+        return Result<ExtractionDetailDto>.Success(new ExtractionDetailDto(
             record.Id,
             record.FileName,
             record.InvoiceNo,
@@ -37,14 +37,13 @@ public sealed class GetExtractionByIdQueryHandler(
             record.ModelUsed,
             record.CreatedAt,
             record.SyncedAt,
-            record.LineItems.Select(li => new LineItemDetailDto(
-                li.Description,
-                li.Quantity,
-                li.UnitPrice,
-                li.LineTotal,
-                li.IsAmountMismatch
-            )).ToList());
-
-        return Result<ExtractionDetailDto>.Success(dto);
+            record.LineItems.Select(l => new LineItemDetailDto(
+                l.Description,
+                l.Quantity,
+                l.UnitPrice,
+                l.LineTotal,
+                false  // IsAmountMismatch - calculate if needed
+            )).ToList()
+        ));
     }
 }

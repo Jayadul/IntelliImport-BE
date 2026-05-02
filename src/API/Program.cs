@@ -24,7 +24,7 @@ builder.Services.AddInfrastructure(builder.Configuration);
 
 // MediatR
 builder.Services.AddMediatR(cfg =>
-    cfg.RegisterServicesFromAssemblyContaining<ProcessPdfCommand>());
+    cfg.RegisterServicesFromAssemblyContaining<ApproveSyncCommand>());
 
 // CORS
 builder.Services.AddCors(opts => opts.AddPolicy("Angular", p =>

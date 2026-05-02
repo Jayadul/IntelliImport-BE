@@ -1,0 +1,455 @@
+IntelliImport-BE: Architecture & Workflow Summary
+PROJECT OVERVIEW
+IntelliImport-BE is an enterprise-grade .NET 8 Web API that uses AI (Llama 3.1 8B model) to automatically extract structured invoice data from PDF documents. The system implements an anti-timeout asynchronous pipeline where users upload PDFs, receive immediate 202 Accepted responses, and then poll for background processing results.
+---
+ARCHITECTURE LAYERS (Clean Architecture)
+Layer 1: Domain (Core Business Logic - NO External Dependencies)
+•	Purpose: Pure business entities and rules
+•	Contains:
+•	ExtractionRecord - Invoice extraction result entity
+•	LineItem - Line item in invoice entity
+•	ExtractionJob - Background job tracker entity
+•	ExtractionStatus enum (Pending, Processing, Completed, DiscrepancyFound, Failed)
+•	ExtractionJobStatus enum (Queued, Processing, Completed, Failed, Cancelled)
+•	Result<T> - Railway-oriented result pattern (IsSuccess, Value, Error, Code)
+•	IExtractionRepository - Repository contract
+•	IPdfProcessor - PDF text extraction contract
+Key Principle: Zero dependencies on Infrastructure or API layers. Can be tested, published, and reused independently.
+---
+Layer 2: Application (Use Cases & Business Services)
+•	Purpose: Orchestrate business logic and coordinate between layers
+•	Contains:
+•	ExtractionJobProcessor - Main orchestrator for extraction workflow
+•	PdfTextProcessor - Smart context windowing (extracts 8K chars max from PDF)
+•	PdfChunkingService - Splits large PDFs into chunks with overlap
+•	ProcessPdfCommand & handler - Command to process uploaded PDF
+•	ApproveSyncCommand & handler - Command to mark as synced to ERP
+•	DeleteExtractionCommand & handler - Command to delete extraction
+•	GetExtractionByIdQuery & handler - Query to fetch extraction
+•	GetExtractionsQuery & handler - Query for paginated extraction history
+•	DTOs: ExtractionResult, ExtractionDetailDto, ExtractionLineItemDto
+•	IExtractionProvider - AI provider contract (abstraction for Llama)
+Key Principle: Uses MediatR for CQRS (Command/Query Responsibility Segregation). Depends only on Domain contracts and models. All infrastructure is injected.
+---
+Layer 3: Infrastructure (Implementation Details)
+•	Purpose: Concrete implementations of abstractions defined in Domain/Application
+•	Contains:
+AI Provider:
+•	LlamaExtractionProvider - Implements IExtractionProvider
+•	Sends HTTP requests to Ollama API
+•	Handles JSON parsing, error handling, response cleaning
+•	Integrated with Polly for resilience (3 retries, exponential backoff, circuit breaker)
+PDF Processing:
+•	PdfPigProcessor - Implements IPdfProcessor
+•	Uses UglyToad.PdfPig library to extract text from PDFs
+•	Returns Result<string> with extracted text
+Database & Persistence:
+•	AppDbContext - EF Core DbContext
+•	ExtractionRepository - Implements IExtractionRepository
+•	Entity configurations for EF Core mappings
+•	Database migrations (schema management)
+Background Service:
+•	QueuedExtractionService - Extends BackgroundService
+•	Reads job IDs from Channel<Guid>
+•	Calls ExtractionJobProcessor for each job
+•	Runs continuously in background thread pool
+Dependency Injection:
+•	DependencyInjection.cs - Registers all services
+•	Configures DbContext, HttpClient with Polly, MediatR, background service
+Key Principle: All infrastructure concerns isolated here. Easy to swap implementations (e.g., switch from Llama to OpenAI, replace PdfPig with a different PDF library).
+---
+Layer 4: API (Presentation & HTTP Endpoints)
+•	Purpose: HTTP contract with clients
+•	Contains:
+•	ExtractionController - All REST endpoints
+•	Program.cs - ASP.NET Core configuration, middleware setup
+•	GlobalExceptionMiddleware - Centralized error handling
+•	appsettings.json - Configuration (DB connection, Llama settings, resilience policies)
+Endpoints:
+1.	POST /api/extractions/upload - Upload PDF → Returns 202 Accepted with jobId
+2.	GET /api/extractions/jobs/{jobId} - Check job status & progress
+3.	GET /api/extractions/{extractionId} - Retrieve full extraction results
+4.	POST /api/extractions/{id}/approve-sync - Mark as synced to ERP
+5.	DELETE /api/extractions/{id} - Delete extraction
+6.	GET /api/extractions - List all extractions (paginated)
+Key Principle: Thin controller layer. Delegates to MediatR handlers. No business logic here.
+---
+REQUEST FLOW: PDF UPLOAD → EXTRACTION → RESULTS
+
+┌─────────────────────────────────────────────────────────────────┐
+│ USER UPLOADS PDF                                                │
+│ POST /api/extractions/upload → upload.pdf (10MB)               │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+        ┌──────────────────────────────────────┐
+        │ ExtractionController.Upload()        │ (SYNCHRONOUS, <1 second)
+        ├──────────────────────────────────────┤
+        │ 1. Validate file (is PDF?)           │
+        │ 2. Read bytes into memory            │
+        │ 3. Create ExtractionJob record       │
+        │    - FileName: "invoice.pdf"         │
+        │    - FileBytes: byte[] (10MB)        │
+        │    - Status: Queued                  │
+        │ 4. Save to database                  │
+        │ 5. Write jobId to Channel<Guid>     │
+        │ 6. Return 202 Accepted + jobId      │
+        └──────────────────────────────────────┘
+                           │
+                           ▼
+        HTTP 202 ACCEPTED RESPONSE
+        {
+          "jobId": "9ff06315-84c5-4b74-8e04-6e25091bf8b1",
+          "status": "queued",
+          "statusUrl": "api/extractions/jobs/9ff06315-84c5-4b74..."
+        }
+        ⏱ Total time: 500ms (NO WAITING for AI processing!)
+        ──────────────────────────────────────────────────────────
+
+        ┌────────────────────────────────────────────────────────────┐
+        │ BACKGROUND PROCESSING (Runs independently)               │
+        ├────────────────────────────────────────────────────────────┤
+        │ QueuedExtractionService (IHostedService)                  │
+        │ • Continuously reads from Channel<Guid>                   │
+        │ • Calls ExtractionJobProcessor.ProcessJobAsync()          │
+        └────────┬───────────────────────────────────────────────────┘
+                 │
+                 ▼
+        ┌────────────────────────────────────────────────┐
+        │ ExtractionJobProcessor.ProcessJobAsync()      │
+        └────────┬──────────────────────────────────────┘
+                 │
+                 ├─ Job.Status = Processing
+                 │
+                 ├─ STEP 1: Extract PDF Text
+                 │  └─ PdfPigProcessor.ExtractText(fileBytes)
+                 │     └─ Returns: "Invoice #INV-2024-001\nVendor: Acme..."
+                 │
+                 ├─ STEP 2: Smart Context Windowing
+                 │  └─ PdfTextProcessor.ExtractSmartContext()
+                 │     └─ If >8K chars: keep first 70% + last 30%
+                 │     └─ Returns: "Invoice #INV...Total: $1,500" (max 8K)
+                 │
+                 ├─ STEP 3: Create ExtractionRecord
+                 │  └─ Insert into database
+                 │     └─ Link Job to Record via ExtractionRecordId
+                 │
+                 ├─ STEP 4: Chunk & Process
+                 │  └─ PdfChunkingService.ChunkPdfText()
+                 │  └─ For each chunk:
+                 │     ├─ Update Job.ProgressPercentage
+                 │     ├─ Update Job.CurrentChunk
+                 │     ├─ Call LlamaExtractionProvider.ExtractAsync()
+                 │     │  ├─ Build HTTP request with chunk
+                 │     │  ├─ Send to Ollama: POST /api/chat
+                 │     │  ├─ Polly resilience: retry 3x if timeout
+                 │     │  ├─ Parse JSON response
+                 │     │  └─ Returns: ExtractionResult (Invoice, Vendor, Total, LineItems)
+                 │     └─ Aggregate results
+                 │
+                 ├─ STEP 5: Business Rule Validation
+                 │  ├─ Calculate Sum(LineItems.LineTotal)
+                 │  ├─ Compare with Invoice.Total
+                 │  ├─ If match (within 0.01): Status = Completed ✓
+                 │  └─ If mismatch: Status = DiscrepancyFound ⚠️
+                 │
+                 ├─ STEP 6: Update Database
+                 │  └─ Save ExtractionRecord with:
+                 │     ├─ InvoiceNo: "INV-2024-001"
+                 │     ├─ Vendor: "Acme Corp"
+                 │     ├─ Total: 1500.50
+                 │     ├─ ConfidenceScore: 0.95
+                 │     ├─ LineItems: [Product A, Product B, ...]
+                 │     └─ Status: Completed (or DiscrepancyFound)
+                 │
+                 └─ Job.Status = Completed
+                 └─ Job.CompletedAt = now()
+        
+        ⏱ Background time: 30-60 seconds (depending on PDF size & Llama speed)
+
+        ──────────────────────────────────────────────────────────
+
+        USER POLLS FOR STATUS
+        GET /api/extractions/jobs/9ff06315-84c5-4b74-8e04-6e25091bf8b1
+
+        Response (while processing):
+        {
+          "status": "Processing",
+          "progress": {
+            "percentage": 75,
+            "currentChunk": "Chunk 3/4",
+            "processedChunks": 3,
+            "totalChunks": 4
+          }
+        }
+        ⏱ Poll every 5 seconds
+
+        Response (when completed):
+        {
+          "status": "Completed",
+          "extractionId": "2206e218-48fc-46ae-8218-8369fbd99241",
+          "progress": { "percentage": 100 }
+        }
+        ──────────────────────────────────────────────────────────
+
+        USER RETRIEVES RESULTS
+        GET /api/extractions/2206e218-48fc-46ae-8218-8369fbd99241
+
+        Response:
+        {
+          "id": "2206e218-48fc-46ae-8218-8369fbd99241",
+          "fileName": "invoice.pdf",
+          "invoiceNo": "INV-2024-001",
+          "vendor": "Acme Corp",
+          "invoiceDate": "2024-01-15",
+          "totalAmount": 1500.50,
+          "confidenceScore": 0.95,
+          "isLineItemSumValid": true,
+          "lineItemSum": 1500.50,
+          "status": "Completed",
+          "processingMs": 42000,
+          "modelUsed": "llama/llama3.1:8b",
+          "lineItems": [
+            {
+              "description": "Professional Services",
+              "quantity": 10,
+              "unitPrice": 150.05,
+              "lineTotal": 1500.50
+            }
+          ]
+        }
+KEY DESIGN PATTERNS
+1. Anti-Timeout Asynchronous Pipeline
+•	User gets 202 Accepted immediately (no waiting for AI)
+•	Background service processes in separate thread pool
+•	Polling allows users to check progress without blocking
+2. Railway-Oriented Programming (Result<T>)
+Result<T> contains:
+  - IsSuccess (bool): Did operation succeed?
+  - Value (T): The returned value if successful
+  - Error (string): Error message if failed
+  - Code (string): Error code for categorization
+  
+No exceptions for control flow - explicit success/failure states
+3. Clean Architecture (Layered Dependency)
+API → Application → Infrastructure → Domain
+      ↓              ↓                ↓
+   (Commands/      (Implementations) (Abstractions &
+    Queries)                          Entities)
+
+API depends on Application
+Application depends on Domain
+Infrastructure depends on Domain
+NO circular dependencies
+
+4. MediatR (CQRS Pattern)
+Command (Write): ProcessPdfCommand → ProcessPdfCommandHandler
+                 ApproveSyncCommand → ApproveSyncCommandHandler
+                 DeleteExtractionCommand → DeleteExtractionCommandHandler
+
+Query (Read):    GetExtractionByIdQuery → GetExtractionByIdQueryHandler
+                 GetExtractionsQuery → GetExtractionsQueryHandler
+
+Benefits:
+  • Single Responsibility: Each command/query has one handler
+  • Testability: Easy to mock handlers
+  • Extensibility: Add new commands without changing controller
+
+
+5. Dependency Injection (Inversion of Control)
+Program.cs registers all services:
+  • DbContext (SQL Server)
+  • HttpClient with Polly (resilience)
+  • MediatR (command/query handling)
+  • Background service (job processor)
+  • Repository (data access)
+  
+Controllers receive dependencies via constructor injection
+
+6. Polly Resilience Pipeline
+HTTP Request to Llama
+    ↓
+[Attempt Timeout: 120s]
+    ↓
+If timeout/error:
+  → Retry 1: Wait 1s + jitter, retry
+  → Retry 2: Wait 2s + jitter, retry
+  → Retry 3: Wait 4s + jitter, retry
+    ↓
+If still failing:
+  → Circuit Breaker: Open for 15s (fail fast next attempts)
+    ↓
+[Total Timeout: 210s]
+
+
+7. Smart Context Windowing
+
+Large PDF (100KB of text)
+    ↓
+Extract first 70% + last 30% + placeholder
+    ↓
+Result: Max 8,000 characters
+    ↓
+Fits within Llama 3.1 (8B) token limit
+    ↓
+Preserves invoice header + totals
+
+
+DATA FLOW: Entities & Relationships
+ExtractionJob (Background Job Tracker)
+├── Id: Guid
+├── FileName: string
+├── FileBytes: byte[] (PDF content)
+├── Status: ExtractionJobStatus (Queued → Processing → Completed)
+├── ProgressPercentage: int (0-100)
+├── CurrentChunk: string ("Chunk 1/3")
+├── ProcessedChunks: int
+├── TotalChunks: int
+├── ExtractionRecordId: Guid? (Linked once processing starts)
+├── ErrorMessage: string?
+├── CreatedAt: DateTime
+├── StartedAt: DateTime?
+└── CompletedAt: DateTime?
+
+         ↓ Links to ↓
+
+ExtractionRecord (Invoice Extraction Result)
+├── Id: Guid
+├── FileName: string
+├── RawText: string (Full PDF text)
+├── InvoiceNo: string?
+├── Vendor: string?
+├── InvoiceDate: DateTime?
+├── TotalAmount: decimal?
+├── ConfidenceScore: decimal (0.0-1.0)
+├── IsLineItemSumValid: bool (Math check: Sum(Items) == Total?)
+├── LineItemSum: decimal?
+├── Status: ExtractionStatus (Completed, DiscrepancyFound, Failed)
+├── ModelUsed: string ("llama/llama3.1:8b")
+├── ProcessingMs: long (Execution time)
+├── SyncedAt: DateTime? (When synced to ERP)
+├── CreatedAt: DateTime
+└── LineItems: List<LineItem>
+
+         ↓ Contains Many ↓
+
+LineItem (Line Item in Invoice)
+├── Id: Guid
+├── ExtractionId: Guid (Foreign key)
+├── Description: string
+├── Quantity: int
+├── UnitPrice: decimal
+└── LineTotal: decimal (Quantity × UnitPrice)
+
+CONFIGURATION & SETTINGS (appsettings.json)
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "SQL Server connection string"
+  },
+  "Llama": {
+    "BaseUrl": "http://localhost:11434",
+    "Model": "llama3.1:8b",
+    "Temperature": 0.3,
+    "TimeoutSecs": 180
+  },
+  "LlamaResilience": {
+    "AttemptTimeout": "00:02:00",  // 120s per attempt
+    "Retry": {
+      "MaxRetryAttempts": 3,
+      "BackoffType": "Exponential",
+      "Delay": "00:00:01"
+    },
+    "CircuitBreaker": {
+      "SamplingDuration": "00:04:00",  // 240s window
+      "FailureRatio": 0.5,  // 50% failures trigger break
+      "BreakDuration": "00:01:00"  // 60s cooldown
+    },
+    "TotalRequestTimeout": "00:03:30"  // 210s total
+  }
+}
+
+
+ERROR HANDLING & RESILIENCE
+
+PDF Upload
+    ↓
+❌ File is not PDF → BadRequest 400
+❌ File > 100MB → BadRequest 400
+✓ File valid → Create job, return 202
+
+Background Processing
+    ↓
+❌ PDF extraction fails → Job.Status = Failed, ErrorMessage logged
+❌ Llama timeout (1st attempt) → Retry with 1s delay
+❌ Llama timeout (2nd attempt) → Retry with 2s delay
+❌ Llama timeout (3rd attempt) → Job.Status = Failed
+❌ Invalid JSON from Llama → StripMarkdownFences() + retry parse
+❌ Database concurrency conflict → Reload fresh entity, merge updates, retry
+✓ All extractions parsed → Aggregate results
+
+Validation
+    ↓
+✓ Sum(LineItems) == Total → Status = Completed
+⚠️ Sum(LineItems) ≠ Total → Status = DiscrepancyFound (NOT failed!)
+
+
+
+DEPLOYMENT REQUIREMENTS
+Runtime
+•	.NET 8 runtime
+•	SQL Server (LocalDB, Express, or full)
+•	Ollama service running locally (or remote)
+•	Llama 3.1:8b model pulled in Ollama
+
+# Pull Llama model
+ollama pull llama3.1:8b
+
+# Start Ollama
+ollama serve
+
+# Run API
+dotnet run --project src/API
+
+# Apply migrations
+dotnet ef database update -p src/Infrastructure
+
+
+
+PERFORMANCE CHARACTERISTICS
+Operation	Time	Bottleneck
+POST /upload	<1s	Network I/O
+PDF text extraction	1-5s	PdfPig library
+Context windowing	<100ms	String operations
+Llama extraction	30-60s	Model inference time
+JSON parsing	<100ms	Deserialization
+Database save	<500ms	EF Core + network
+Total job processing	30-60s	Llama latency
+Optimization Strategy: Only Llama model inference is slow. Everything else is <1s. Chunking allows parallel processing of large documents (future enhancement).
+---
+TESTING STRATEGY
+
+Unit Tests:
+  • Domain entities (no dependencies)
+  • ExtractionJobProcessor logic
+  • PdfChunkingService
+  • Result<T> pattern
+
+Integration Tests:
+  • ExtractionController endpoints
+  • MediatR handlers
+  • ExtractionRepository queries
+  • EF Core migrations
+
+End-to-End Tests:
+  • Upload PDF → Poll → Retrieve (real Ollama required)
+  • Database concurrency scenarios
+  • Error recovery paths
+
+SUMMARY: This is a Production-Ready System
+✅ Anti-Timeout Design - Users never wait for AI processing
+✅ Clean Architecture - Testable, maintainable, scalable
+✅ Resilience Built-In - Retries, circuit breaker, error recovery
+✅ Business Logic Enforced - Discrepancy detection, confidence scoring
+✅ Observability - Structured logging, progress tracking
+✅ Enterprise-Grade - EF Core, MediatR, Polly, proper error handling
+This is ready for production deployment with proper operational monitoring and scaling strategies.

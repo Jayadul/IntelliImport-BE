@@ -28,7 +28,7 @@ public sealed class ExtractionJobProcessor(
             // Step 1: Extract PDF text
             logger.LogInformation("Extracting text from {File}", job.FileName);
             var textResult = pdfProcessor.ExtractText(job.FileBytes);
-            
+
             if (!textResult.IsSuccess)
             {
                 job.Status = ExtractionJobStatus.Failed;
@@ -84,40 +84,28 @@ public sealed class ExtractionJobProcessor(
                     await Task.Delay(500, ct);
             }
 
-            // Step 5: Aggregate and validate
-            logger.LogInformation("Aggregating {Count} chunk results", aggregatedResults.Count);
+            // Step 5: Aggregate & validate
+            logger.LogInformation("Aggregating results from {Count} chunks", aggregatedResults.Count);
             var finalResult = AggregateResults(aggregatedResults);
 
-            // Step 6: Apply business rules (discrepancy detection)
             var lineItemSum = finalResult.LineItems.Sum(li => li.LineTotal);
-            var hasDiscrepancy = finalResult.Total.HasValue && 
-                Math.Abs(lineItemSum - finalResult.Total.Value) > 0.01m;
+            var isValid = finalResult.Total.HasValue &&
+                          Math.Abs(lineItemSum - finalResult.Total.Value) < 0.01m;
 
-            if (hasDiscrepancy)
-            {
-                job.ErrorMessage = $"Discrepancy detected: Sum of line items ({lineItemSum:C}) " +
-                    $"does not match Total ({finalResult.Total:C})";
-                logger.LogWarning(job.ErrorMessage);
-            }
+            // Step 6: Update extraction record
+            record.InvoiceNo = finalResult.InvoiceNo;
+            record.Vendor = finalResult.Vendor;
+            record.TotalAmount = finalResult.Total;
+            record.ConfidenceScore = finalResult.ConfidenceScore;
+            record.LineItemSum = lineItemSum;
+            record.IsLineItemSumValid = isValid;
+            record.Status = isValid ? ExtractionStatus.Completed
+                                      : ExtractionStatus.DiscrepancyFound;
 
-            // Step 7: Reload and update fresh record
-            var freshRecord = await extractionRepository.GetByIdAsync(record.Id, ct);
-            if (freshRecord is null)
-            {
-                job.Status = ExtractionJobStatus.Failed;
-                job.ErrorMessage = "Record was deleted during processing";
-                return;
-            }
+            if (DateTime.TryParse(finalResult.Date, out var parsedDate))
+                record.InvoiceDate = parsedDate;
 
-            freshRecord.InvoiceNo = finalResult.InvoiceNo;
-            freshRecord.Vendor = finalResult.Vendor;
-            freshRecord.TotalAmount = finalResult.Total;
-            freshRecord.ConfidenceScore = finalResult.ConfidenceScore;
-            freshRecord.Status = hasDiscrepancy 
-                ? ExtractionStatus.DiscrepancyFound 
-                : ExtractionStatus.Completed;
-            freshRecord.ErrorMessage = job.ErrorMessage;
-            freshRecord.LineItems = finalResult.LineItems.Select(li => new LineItem
+            record.LineItems = finalResult.LineItems.Select(li => new LineItem
             {
                 Description = li.Description,
                 Quantity = li.Quantity,
@@ -125,15 +113,17 @@ public sealed class ExtractionJobProcessor(
                 LineTotal = li.LineTotal
             }).ToList();
 
-            await extractionRepository.UpdateAsync(freshRecord, ct);
+            record.ProcessingMs = (long)(DateTime.UtcNow - job.StartedAt!.Value).TotalMilliseconds;
+            await extractionRepository.UpdateAsync(record, ct);
 
             job.Status = ExtractionJobStatus.Completed;
             job.CompletedAt = DateTime.UtcNow;
             job.ProgressPercentage = 100;
+            job.ProcessedChunks = chunks.Count;
 
             logger.LogInformation(
-                "Job {Id} completed: {Invoice} from {Vendor}",
-                job.Id, finalResult.InvoiceNo ?? "unknown", finalResult.Vendor ?? "unknown");
+                "Job {Id} completed. Invoice={Invoice}, Vendor={Vendor}, Valid={Valid}",
+                job.Id, finalResult.InvoiceNo, finalResult.Vendor, isValid);
         }
         catch (OperationCanceledException)
         {

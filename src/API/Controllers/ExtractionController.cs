@@ -1,8 +1,10 @@
+using IntelliImport.Application.Abstractions;
 using IntelliImport.Application.Features.Extractions.Commands;
 using IntelliImport.Application.Features.Extractions.Queries;
 using IntelliImport.Domain.Entities;
 using IntelliImport.Infrastructure.Persistence;
-using System.Threading.Channels;
+using MediatR;
+using Microsoft.AspNetCore.Mvc;
 
 namespace IntelliImport.API.Controllers;
 
@@ -14,8 +16,8 @@ namespace IntelliImport.API.Controllers;
 [Route("api/extractions")]
 [Produces("application/json")]
 public sealed class ExtractionController(
-    ChannelWriter<Guid> extractionQueue,
     ISender mediator,
+    IJobQueue jobQueue,
     AppDbContext dbContext) : ControllerBase
 {
     /// <summary>
@@ -29,10 +31,10 @@ public sealed class ExtractionController(
     public async Task<IActionResult> Upload(IFormFile file, CancellationToken ct)
     {
         if (file is null || file.Length == 0)
-            return BadRequest(new { error = "No file uploaded" });
+            return BadRequest(new { error = "No file uploaded." });
 
         if (!file.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase))
-            return BadRequest(new { error = "Only PDF files accepted" });
+            return BadRequest(new { error = "Only PDF files are accepted." });
 
         // Read file
         using var ms = new MemoryStream();
@@ -48,16 +50,16 @@ public sealed class ExtractionController(
         dbContext.ExtractionJobs.Add(job);
         await dbContext.SaveChangesAsync(ct);
 
-        // Queue for processing
-        await extractionQueue.WriteAsync(job.Id, ct);
+        // Signal background service via in-memory channel (no polling overhead)
+        jobQueue.Enqueue(job.Id);
 
         // Return 202 Accepted immediately
         return Accepted($"api/extractions/jobs/{job.Id}", new
         {
             jobId = job.Id,
             status = "queued",
-            message = "Processing started. Poll status endpoint for progress.",
-            statusUrl = $"api/extractions/jobs/{job.Id}"
+            statusUrl = $"api/extractions/jobs/{job.Id}",
+            message = "PDF queued for processing. Poll statusUrl for progress."
         });
     }
 
@@ -69,11 +71,11 @@ public sealed class ExtractionController(
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetJobStatus(Guid jobId, CancellationToken ct)
     {
-        var job = await dbContext.ExtractionJobs.FindAsync(
-            new object[] { jobId }, cancellationToken: ct);
+        var job = await dbContext.ExtractionJobs
+            .FindAsync(new object[] { jobId }, cancellationToken: ct);
 
         if (job is null)
-            return NotFound();
+            return NotFound(new { error = $"Job {jobId} not found." });
 
         return Ok(new
         {
@@ -88,12 +90,9 @@ public sealed class ExtractionController(
             },
             extractionId = job.ExtractionRecordId,
             error = job.ErrorMessage,
-            timing = new
-            {
-                createdAt = job.CreatedAt,
-                startedAt = job.StartedAt,
-                completedAt = job.CompletedAt
-            }
+            createdAt = job.CreatedAt,
+            startedAt = job.StartedAt,
+            completedAt = job.CompletedAt
         });
     }
 
@@ -105,9 +104,7 @@ public sealed class ExtractionController(
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetExtraction(Guid extractionId, CancellationToken ct)
     {
-        var result = await mediator.Send(
-            new GetExtractionByIdQuery(extractionId), ct);
-
+        var result = await mediator.Send(new GetExtractionByIdQuery(extractionId), ct);
         return result.IsSuccess
             ? Ok(result.Value)
             : NotFound(new { error = result.Error });
@@ -122,10 +119,9 @@ public sealed class ExtractionController(
     public async Task<IActionResult> ApproveSync(Guid id, CancellationToken ct)
     {
         var result = await mediator.Send(new ApproveSyncCommand(id), ct);
-
         return result.IsSuccess
             ? Ok(new { message = "Successfully synced to ERP.", extractionId = id })
-            : BadRequest(new { error = result.Error, code = result.Error });
+            : BadRequest(new { error = result.Error, code = result.Code });
     }
 
     /// <summary>
@@ -137,25 +133,8 @@ public sealed class ExtractionController(
     public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
     {
         var result = await mediator.Send(new DeleteExtractionCommand(id), ct);
-
         return result.IsSuccess
             ? NoContent()
             : NotFound(new { error = result.Error });
-    }
-
-    /// <summary>
-    /// Get paginated extraction history.
-    /// </summary>
-    [HttpGet]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<IActionResult> GetAll(
-        [FromQuery] int page = 1,
-        [FromQuery] int pageSize = 20,
-        CancellationToken ct = default)
-    {
-        var result = await mediator.Send(
-            new GetExtractionsQuery(page, Math.Min(pageSize, 100)), ct);
-
-        return result.IsSuccess ? Ok(result.Value) : NotFound();
     }
 }
