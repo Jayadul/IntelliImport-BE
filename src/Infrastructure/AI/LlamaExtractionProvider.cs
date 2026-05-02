@@ -1,182 +1,142 @@
-using System.Text;
+using System.Net.Http.Json;
 using System.Text.Json;
 using IntelliImport.Application.Abstractions;
 using IntelliImport.Application.Models;
-using IntelliImport.Application.Services;
 using IntelliImport.Domain.Results;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace IntelliImport.Infrastructure.AI;
 
-public sealed class LlamaOptions
-{
-    public string BaseUrl { get; set; } = "http://localhost:11434";
-    public string Model { get; set; } = "llama3.1:8b";
-    public double Temperature { get; set; } = 0.3;
-    public int TimeoutSecs { get; set; } = 120;
-}
-
-/// <summary>
-/// Llama 3.1 (8B) extraction provider with smart context windowing.
-/// Optimized for enterprise invoice extraction with strict JSON schema enforcement.
-/// Includes validation notes and business rule checks.
-/// </summary>
 public sealed class LlamaExtractionProvider(
     HttpClient httpClient,
     IOptions<LlamaOptions> options,
-    PdfTextProcessor textProcessor,
-    ILogger<LlamaExtractionProvider> logger
-) : IExtractionProvider
+    ILogger<LlamaExtractionProvider> logger) : IExtractionProvider
 {
     private readonly LlamaOptions _opts = options.Value;
 
-    public string ProviderName => $"llama/{_opts.Model}";
+    public string ProviderName => $"ollama/{_opts.Model}";
 
-    private const string SystemPrompt = """
-        You are a precision invoice data extraction system.
-        
-        CRITICAL RULES:
-        1. Extract ONLY to the provided JSON schema - no markdown, no explanation
-        2. Use null for any missing or uncertain fields
-        3. Calculate LineTotal = Quantity × UnitPrice for validation
-        4. Provide a ValidationNote explaining any data quality issues
-        5. Return VALID, well-formed JSON ONLY
-        
-        JSON Schema:
-        {
-          "InvoiceNo": "string or null",
-          "Vendor": "string or null", 
-          "Date": "YYYY-MM-DD or null",
-          "Total": "decimal or null",
-          "ConfidenceScore": "0.0-1.0",
-          "ValidationNote": "string explaining any issues or uncertainties",
-          "LineItems": [
-            {
-              "Description": "string",
-              "Quantity": "integer",
-              "UnitPrice": "decimal",
-              "LineTotal": "decimal (must equal Quantity × UnitPrice)"
-            }
-          ]
-        }
-        
-        VALIDATION RULES:
-        - If you find discrepancies, document in ValidationNote
-        - Set ConfidenceScore reflecting your certainty (0.0 = no confidence, 1.0 = absolute)
-        - If data is ambiguous, use null and explain in ValidationNote
-        """;
+    private static readonly string SystemPrompt = "You are an invoice data extraction assistant. Always respond with valid JSON only. No explanation, no markdown, no code fences.";
 
     public async Task<Result<ExtractionResult>> ExtractAsync(
         string pdfText, CancellationToken ct = default)
     {
+        var prompt = BuildPrompt(pdfText);
+
+        var requestBody = new
+        {
+            model = _opts.Model,
+            messages = new[]
+            {
+                new { role = "system", content = SystemPrompt },
+                new { role = "user", content = prompt }
+            },
+            stream = false,
+            temperature = _opts.Temperature
+        };
+
         try
         {
-            // Step 1: Smart context extraction (8K char limit for Llama 3.1)
-            var smartText = textProcessor.ExtractSmartContext(pdfText);
-            var tokenCount = textProcessor.EstimateTokenCount(smartText);
-            
-            logger.LogInformation(
-                "Extracted smart context: {Chars} chars, ~{Tokens} tokens from {Total} chars",
-                smartText.Length, tokenCount, pdfText.Length);
+            logger.LogInformation("Sending extraction request to Ollama model {Model}", _opts.Model);
 
-            // Step 2: Build request with smart context
-            var userMessage = $"Extract invoice data:\n\n{smartText}";
-            var requestBody = new
-            {
-                model = _opts.Model,
-                stream = false,
-                options = new 
-                { 
-                    temperature = _opts.Temperature,
-                    num_ctx = 8192 // Llama 3.1 context window
-                },
-                messages = new[]
-                {
-                    new { role = "system", content = SystemPrompt },
-                    new { role = "user", content = userMessage }
-                }
-            };
+            var response = await httpClient.PostAsJsonAsync("/api/chat", requestBody, ct);
+            response.EnsureSuccessStatusCode();
 
-            var json = JsonSerializer.Serialize(requestBody);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-            logger.LogDebug("Requesting Llama extraction: model={Model}, tokens={Tokens}",
-                _opts.Model, tokenCount);
-
-            // Step 3: Send request with Polly resilience
-            var response = await httpClient.PostAsync("/api/chat", content, ct);
             var responseBody = await response.Content.ReadAsStringAsync(ct);
+            logger.LogDebug("Raw Ollama response: {Response}", responseBody);
 
-            if (!response.IsSuccessStatusCode)
-            {
-                logger.LogWarning(
-                    "Llama request failed: {StatusCode}\nResponse: {Response}",
-                    response.StatusCode, responseBody[..Math.Min(500, responseBody.Length)]);
-                
-                return Result<ExtractionResult>.Failure($"Llama request failed with status {response.StatusCode}", "LLAMA_HTTP_ERROR");
-            }
+            return ParseResponse(responseBody);
+        }
+        catch (HttpRequestException ex)
+        {
+            logger.LogError(ex, "HTTP error calling Ollama");
+            return Result<ExtractionResult>.Failure($"Ollama HTTP error: {ex.Message}", "OLLAMA_HTTP_ERROR");
+        }
+        catch (TaskCanceledException ex)
+        {
+            logger.LogError(ex, "Ollama request timed out");
+            return Result<ExtractionResult>.Failure("Ollama request timed out", "OLLAMA_TIMEOUT");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Unexpected error calling Ollama");
+            return Result<ExtractionResult>.Failure($"Unexpected error: {ex.Message}", "OLLAMA_UNKNOWN");
+        }
+    }
 
-            // Step 4: Parse response
+    private Result<ExtractionResult> ParseResponse(string responseBody)
+    {
+        try
+        {
             using var doc = JsonDocument.Parse(responseBody);
-            var rawMessage = doc.RootElement
+            var messageContent = doc.RootElement
                 .GetProperty("message")
                 .GetProperty("content")
                 .GetString() ?? string.Empty;
 
-            logger.LogDebug("Llama response length: {Len} chars", rawMessage.Length);
+            logger.LogDebug("Extracted message content: {Content}", messageContent);
 
-            // Step 5: Clean JSON (remove markdown if present)
-            var cleanJson = StripMarkdownFences(rawMessage);
+            var cleaned = StripMarkdownFences(messageContent.Trim());
+            logger.LogInformation("Cleaned AI response for parsing: {Cleaned}", cleaned);
 
-            // Step 6: Deserialize with validation
-            var result = JsonSerializer.Deserialize<ExtractionResult>(cleanJson,
+            var result = JsonSerializer.Deserialize<ExtractionResult>(cleaned,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
 
             if (result is null)
-            {
-                return Result<ExtractionResult>.Failure("Llama returned null result", "NULL_RESULT");
-            }
+                return Result<ExtractionResult>.Failure("Deserialized result was null", "PARSE_NULL");
 
-            logger.LogInformation(
-                "Extraction successful: Invoice={Invoice}, Vendor={Vendor}, Confidence={Confidence:F2}",
-                result.InvoiceNo ?? "unknown",
-                result.Vendor ?? "unknown",
-                result.ConfidenceScore);
-
+            result.ConfidenceScore = result.ConfidenceScore == 0 ? 0.85m : result.ConfidenceScore;
             return Result<ExtractionResult>.Success(result);
         }
         catch (JsonException ex)
         {
-            logger.LogError(ex, "Failed to parse Llama JSON response");
-            return Result<ExtractionResult>.Failure($"Invalid JSON from Llama: {ex.Message}", "INVALID_JSON");
-        }
-        catch (HttpRequestException ex)
-        {
-            logger.LogError(ex, "Llama HTTP request failed");
-            return Result<ExtractionResult>.Failure($"Llama connection failed: {ex.Message}", "LLAMA_UNREACHABLE");
-        }
-        catch (OperationCanceledException ex)
-        {
-            logger.LogWarning(ex, "Llama request cancelled (timeout)");
-            return Result<ExtractionResult>.Failure("Llama request timeout", "LLAMA_TIMEOUT");
+            logger.LogError(ex, "Failed to parse Ollama JSON response: {Body}", responseBody);
+            return Result<ExtractionResult>.Failure($"JSON parse error: {ex.Message}", "PARSE_ERROR");
         }
     }
 
-    private static string StripMarkdownFences(string raw)
+    private static string StripMarkdownFences(string text)
     {
-        var trimmed = raw.Trim();
-        
-        if (trimmed.StartsWith("```"))
-        {
-            var firstNewline = trimmed.IndexOf('\n');
-            if (firstNewline > 0)
-                trimmed = trimmed[(firstNewline + 1)..];
-            
-            if (trimmed.EndsWith("```"))
-                trimmed = trimmed[..^3];
-        }
+        if (text.StartsWith("```json", StringComparison.OrdinalIgnoreCase))
+            text = text["```json".Length..].TrimStart();
+        else if (text.StartsWith("```"))
+            text = text["```".Length..].TrimStart();
 
-        return trimmed.Trim();
+        if (text.EndsWith("```"))
+            text = text[..^"```".Length].TrimEnd();
+
+        return text.Trim();
+    }
+
+    private static string BuildPrompt(string pdfText)
+    {
+        const string jsonSchema = """
+            {
+              "invoiceNo": "string or null",
+              "vendor": "string or null",
+              "date": "YYYY-MM-DD string or null",
+              "total": "number or null",
+              "confidenceScore": "number between 0.0 and 1.0",
+              "lineItems": [
+                {
+                  "description": "string",
+                  "quantity": "integer",
+                  "unitPrice": "number",
+                  "lineTotal": "number"
+                }
+              ]
+            }
+            """;
+
+        return $"""
+            Extract invoice data from the following document text and return ONLY a JSON object.
+            
+            REQUIRED JSON FORMAT (return nothing else, no explanation):
+            {jsonSchema}
+            
+            DOCUMENT TEXT:
+            {pdfText}
+            """;
     }
 }

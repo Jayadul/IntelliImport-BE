@@ -1,8 +1,6 @@
 using IntelliImport.Application.Abstractions;
 using IntelliImport.Application.Services;
-using IntelliImport.Domain.Enums;
 using IntelliImport.Infrastructure.Persistence;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -31,13 +29,17 @@ public sealed class ExtractionBackgroundService(
                 var job = await db.ExtractionJobs.FindAsync(new object[] { jobId }, stoppingToken);
                 if (job is null)
                 {
-                    logger.LogWarning("Job {Id} not found in database, skipping", jobId);
+                    logger.LogWarning("Job {Id} not found, skipping", jobId);
                     continue;
                 }
 
-                logger.LogInformation("Processing job {Id}", job.Id);
                 await processor.ProcessJobAsync(job, stoppingToken);
+
+                // Entity is already tracked by this DbContext — just save
                 await db.SaveChangesAsync(stoppingToken);
+
+                logger.LogInformation("Job {Id} persisted with status {Status}",
+                    job.Id, job.Status);
             }
             catch (OperationCanceledException)
             {
